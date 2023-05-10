@@ -1,0 +1,281 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+counts <- read.table('/Users/eemanabbasi/Desktop/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/test.tsv', sep = "\t",row.names = 1) 
+qcMet<-  read.csv("/Users/eemanabbasi/Desktop/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/metadata_species_WIS_overlapping_fungi_bacteria_12773samples.tsv" ,sep='\t',row.names = 1)
+tax<- read.table('/Users/eemanabbasi/Desktop/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/mycobiome/Final_files/taxonomy_table_WIS_overlapping_fungi_bacteria.txt', sep = "\t", row.names = 1)
+
+immune_tcga = read.table("/Users/eemanabbasi/Desktop/thesis_project_second_microbiome_analysis/m_analysis/TCGA_analysis/tcga_immune/tcga_immune.txt", sep = "\t", encoding = "UTF-16", row.names = 1)
+col_names <- as.character(immune_tcga[1, ])
+colnames(immune_tcga) <- col_names
+immune_tcga <- immune_tcga[-1, ]
+colnames(immune_tcga) <- gsub(" ", "_", colnames(immune_tcga))
+
+replace_tissue_normal <- function(sample_type) {
+  return(gsub("Solid Tissue Normal", "Normal", sample_type))
+}
+replace_blood_normal <- function(sample_type) {
+  return(gsub("Blood Derived Normal", "Normal", sample_type))
+}
+
+# Apply the function to a vector of sample types
+qcMet$sample_type <- replace_tissue_normal(qcMet$sample_type)
+qcMet$sample_type <- replace_blood_normal(qcMet$sample_type)
+
+#qcMet <- qcMet[qcMet$sample_type != "Recurrent Tumor", ]
+
+colnames(counts)<- rownames(qcMet)
+colnames(tax) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+tax <- tax[match(rownames(counts), rownames(tax)),]
+
+```
+
+```{r}
+organ_met = subset(qcMet, disease_type == "Kidney Renal Clear Cell Carcinoma")
+
+organ_counts <- counts[,rownames(organ_met)]
+tax_organ <- tax[match(rownames(organ_counts), rownames(tax)),]
+
+organ_met_tumor = subset(organ_met, sample_type %in% c( "Primary Tumor") )
+organ_counts_tumor = organ_counts[,rownames(organ_met_tumor)]
+tax_tumor<- tax_organ[match(rownames(organ_counts_tumor), rownames(tax_organ)),]
+
+tcga_ids <- lapply(organ_met_tumor$tcga_sample_id, function(x) gsub("-01A", "", x, fixed = TRUE))
+tcga_ids <- lapply(tcga_ids, function(x) gsub("-01B", "", x, fixed = TRUE))
+tcga_ids = unlist(tcga_ids, use.names = FALSE)
+
+immune_tumor_tcga = immune_tcga[match(tcga_ids, rownames(immune_tcga)),]
+
+organ_met_normal = subset(organ_met, sample_type %in% c( "Normal"))
+organ_counts_normal = organ_counts[,rownames(organ_met_normal)]
+tax_normal<- tax_organ[match(rownames(organ_counts_normal), rownames(tax_organ)),]
+
+#immune_normal = immune_tcga[match((organ_met_normal$tcga_sample_id), rownames(immune_tcga)),]
+
+#brain_met_recur = subset(brain_met, sample_type %in% c( "Recurrent Tumor"))
+#brain_counts_recur = brain_counts[,rownames(brain_met_recur)]
+#tax_recur<- tax_brain[match(rownames(brain_counts_recur), rownames(tax_brain)),]
+
+#immune_recur = immune_tcga[match((brain_met_recur$tcga_sample_id), rownames(immune_tcga)),]
+
+```
+
+```{r}
+library(phyloseq)
+
+# Collapse taxonomic information by phylum
+otda<- as.matrix.data.frame(organ_counts)
+OTU = phyloseq::otu_table(otda, taxa_are_rows=TRUE)
+tax_t<- as.matrix.data.frame(tax_organ)
+taxda<- phyloseq::tax_table(tax_t)
+sample<- sample_data(organ_met)
+ps <- phyloseq(OTU, sample, taxda)
+
+```
+
+```{r}
+library(vegan)
+library(ggplot2)
+otu_mat <- as.matrix(t(otu_table(ps)))
+umap_res <- uwot::umap(otu_mat, n_components = 2)
+
+umap_df <- data.frame(V1 = umap_res[, 1], V2 = umap_res[, 2], SampleType = sample_data(ps)$sample_type)
+
+ggplot(umap_df, aes(x = V1, y = V2, color = SampleType )) +
+  geom_point()
+
+```
+
+```{r}
+
+library(MicrobiotaProcess)
+library(phyloseq)
+library(tidyverse)
+alphaobj <- get_alphaindex(ps)
+head(as.data.frame(alphaobj))
+
+
+p_alpha <- ggbox(alphaobj, geom="violin", factorNames="sample_type") +
+           scale_fill_manual(values=c("#00AED7", "#FD9347", "#6C757D", "#6C957D"))+
+           theme(strip.background = element_rect(colour=NA, fill="grey"))+  theme(axis.text.x = element_blank())
+p_alpha
+
+```
+
+```{r}
+cooccur_filter <- function(RA="relative abundance", co_per=0.5){
+  #create logic (0/1) response for presence or absence of count data
+  logic_RA=(RA>0)*1
+
+  #check for exceeding co-occurence threshold (default: 50%)
+  filter=(colSums(logic_RA)/nrow(logic_RA))>=co_per
+  filter_RA=RA[,filter]
+  return(filter_RA)
+}
+#'cooccurence
+#'
+cooccurrence<-function(data ="relative abundance",taxon=NULL,type="sp",cor=0.8,pval=0.01){
+  require(igraph)
+  require(Hmisc)
+  #Create Correlation Matrix
+  ifelse(type=="sp",corrMatrix <- rcorr(as.matrix(data),type="spearman"),corrMatrix <- rcorr(as.matrix(data),type="pearson"))
+  #Adjust P-values
+  pAdjusted=p.adjust(corrMatrix$P,method = "BH")
+  #Filter Correlation Matrix by P value and Correlation Value
+  corrMatrixMin=(((abs(corrMatrix$r)>cor)*1+(pAdjusted<pval)*1)==2)*1
+  #Remove Self Correlation
+  diag(corrMatrixMin)=0
+  #Preserve Taxonomy Information
+  corrMatrixTax=corrMatrixMin[rowSums(corrMatrixMin)>1,colSums(corrMatrixMin)>1]
+  #taxon.netw=droplevels(taxon[which(rownames(taxon)%in%gsub("V","",colnames(corrMatrixTax))),])
+  #Create network
+
+  netw.corr=graph.adjacency(corrMatrixMin,mode="undirected",weighted=TRUE)
+  #Remove Vertices with only 1 connection
+  netw.corr.trim=delete_vertices(netw.corr,igraph::degree(netw.corr)<1)
+
+  #filter taxonomy information for use later
+  ifelse(is.null(taxon),taxon.netw <- NULL,taxon.netw <- taxon[which(taxon[,1]%in%V(netw.corr.trim)$name),])
+
+  return(list("corr"=corrMatrix,"corrMin"=corrMatrixMin,"netw"=netw.corr.trim,"taxon.netw"=taxon.netw,pAdjusted=as.matrix(pAdjusted)))
+}
+```
+
+```{r}
+library(igraph)
+library(dplyr)
+library(ggplot2)
+
+RA=((organ_counts_tumor))
+tax_val = tax_tumor
+biom_fil=cooccur_filter(t(RA),co_per=0.5)
+
+#run co-occurence. Taxon can be excluded and identified later if desired.
+biom_netw=cooccurrence(biom_fil,taxon = tax_val)
+#graph_p <- graph.adjacency(biom_netw$corrMin, mode="undirected", weighted=TRUE)
+#walktrap <- cluster_walktrap(graph_p)
+#plot(walktrap, graph, vertex.label=NA)
+
+
+
+co_occurrence_communities <- cluster_fast_greedy(biom_netw$netw, weights = E(biom_netw$netw)$weight)
+co_occurrence_membership <- membership(co_occurrence_communities)
+#co_occurrence_communities <- walktrap
+
+
+node_colors <- rainbow(max(co_occurrence_membership)+1)[co_occurrence_membership+1]
+
+# Plot the network with node colors and group labels
+plot(co_occurrence_communities, biom_netw$netw,
+     vertex.label.color="black", vertex.label.cex=0.5)
+
+#plot(co_occurrence_communities, graph_p,
+     #vertex.label.color="black", vertex.label.cex=0.5)
+
+
+co_occurrence_df = as.data.frame(cbind(co_occurrence_communities$membership, co_occurrence_communities$names))
+colnames(co_occurrence_df)<- c("names", "group")
+co_occurrence_df = aggregate(co_occurrence_df$group~co_occurrence_df$names,FUN=c)
+colnames(co_occurrence_df)<- c("names", "group")
+
+community_num <- lapply(co_occurrence_df$group, function(g) count(RA[g,]))
+community_num_df <- as.data.frame((community_num))
+colnames(community_num_df) <- paste0("Group", 1:(ncol(community_num_df)))
+
+
+community_abundance <- lapply(co_occurrence_df$group, function(g) sum(RA[g,]))
+#com_species_abundance <-  lapply(co_occurrence_df$group, function(g) rowSums(RA[g,]))
+
+
+community_df <- as.data.frame((community_abundance))
+colnames(community_df) <- paste0("Group", 1:(ncol(community_df)))
+
+community_num_df$group <- rownames(community_num_df)
+group_count <- colSums(community_num_df[,1:ncol(community_num_df)-1])
+
+
+community_df$group <- rownames(community_df)
+group_abundance <- colSums(community_df[,1:ncol(community_df)-1])
+
+gp_abundance <- as.numeric(group_abundance)
+sp_counts <- as.numeric(group_count)
+group_numbers <- 1:length(gp_abundance)
+data <- data.frame(Group = group_numbers, Abundance = log(gp_abundance), Count = sp_counts)
+
+
+ggplot(data, aes(x = Count, y = Abundance, color = factor(Group))) +
+  geom_point(size = 8) +  scale_fill_brewer(palette ="Set2") + 
+  labs(x = "Species counts", y = "Group Abundance (log scale)", color = "Group") + theme_classic() + theme(axis.text = element_text(size=15, colour = 'Black'), axis.title = element_text(size=15))
+
+
+
+
+
+
+
+
+```
+```{r}
+# Load the ggplot2 library
+library(ggplot2)
+library(ggsci)
+#library(gridExtra)
+
+#scale_color_manual(values = rainbow(length(tumor_data$MRO)))png
+
+options(repr.plot.width=2, repr.plot.height=2)
+
+# Create a dataframe with your data
+tumor_data <- data.frame(Group = c(1,2,3,4,5,6,7),
+                 head_MIP = c(8,1,4,8,4,1,0),
+                 head_MRO = c(0.6181818182,0.8706896552,0.6741573034,0.6262626263,0.6851851852,0.6896551724,0.8))
+
+#png(file="/Users/eemanabbasi/Desktop/thesis_project_second_microbiome_analysis/m_analysis/test.png", width=5, height=4)
+  ggplot(tumor_data, aes(x = head_MIP, y = head_MRO, color = factor(Group))) +
+  geom_point(size = 8) +  scale_color_jama() + 
+  labs(x = "Mutualism", y = "Competition", color = "Group") + theme_classic() + theme(axis.text = element_text(size=15, colour = 'Black'), axis.title = element_text(size=15))
+#dev.off()
+
+```
+```{r}
+
+m2<- as.numeric(immune_tumor_tcga$Macrophages_M2)
+tgf_beta<- as.numeric(immune_tumor_tcga$`TGF-beta_Response`)
+T_reg<- as.numeric(immune_tumor_tcga$`T_Cells_Regulatory_Tregs`)
+inf_gamma<- as.numeric(immune_tumor_tcga$`IFN-gamma_Response`)
+cd8_T<- as.numeric(immune_tumor_tcga$T_Cells_CD8)
+df <- data.frame( Value1 = m2, 
+                 Value2 = cd8_T,
+                 Value3 = tgf_beta,
+                 T_reg =  T_reg,
+                 inf_gamma = inf_gamma)
+
+colnames(df)<- c("M2", "CD8_T cells", "tgf_beta", "T_reg","inf_gamma")
+avg <- colMeans(df)
+
+# Create a box plot with average values
+boxplot(df, col="lightblue", 
+        main="Kidney Renal Clear Cell Carcinoma")
+points(avg, pch=19, col="red")
+
+df_long <- tidyr::gather(df, key = "Immune_Type", value = "Value")
+
+# Create a stacked box plot
+ggplot(df_long, aes(x = Immune_Type, y = Value, fill = Immune_Type)) + 
+  geom_boxplot() +
+  scale_fill_manual(values = c("red", "green", "yellow","black","blue")) +
+  labs(title = "Kidney Renal Clear Cell Carcinoma", y = "Values")+
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  xlab("")
+
+
+
+
+
+```
+
